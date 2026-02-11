@@ -1,0 +1,20 @@
+{
+  "dataset": "reinartz_tep",
+  "window_size": 100,
+  "step_size": 1,
+  "batch_size": 512,
+  "feature_mode": "te_33",
+  "train_percent": 1.0,
+  "seed": 0,
+  "model_type": "gnn_fixed",
+  "adj_path": "data/adjacency/TE_ground_truth.txt",
+  "n_gnn": 1,
+  "n_hidden": 1024,
+  "gsl_type": "relu",
+  "alpha": 0.1,
+  "k": null,
+  "n_epochs": 10,
+  "lr": 0.001,
+  "save_dir": "outputs/runs",
+  "run_name": null
+}

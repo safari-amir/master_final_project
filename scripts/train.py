@@ -15,13 +15,14 @@ from fddbenchmark import FDDDataset, FDDDataloader
 # ---- models ----
 from src.models.baselines.mlp import MLPBaseline
 from src.models.gnn.gnn_fixed_adj import GNN_TAM_FixedAdj
+from src.models.gnn.gnn_trainable_adj import GNN_TAM_Trainable
 
 
 # -------------------------------------------------
 # Argument parser
 # -------------------------------------------------
 def parse_args():
-    p = argparse.ArgumentParser(description="Unified Trainer (MLP + GNN Fixed)")
+    p = argparse.ArgumentParser(description="Unified Trainer (MLP + GNN Fixed + GNN Trainable)")
 
     # data
     p.add_argument("--dataset", type=str, default="reinartz_tep")
@@ -35,11 +36,22 @@ def parse_args():
 
     # model
     p.add_argument("--model_type", type=str, default="mlp",
-                   choices=["mlp", "gnn_fixed"])
+                   choices=["mlp", "gnn_fixed", "gnn_trainable"])
+
+    # fixed adjacency args
     p.add_argument("--adj_path", type=str, default=None,
                    help="Path to adjacency matrix file (.txt or .npy) for gnn_fixed")
+
+    # shared GNN args
     p.add_argument("--n_gnn", type=int, default=1)
     p.add_argument("--n_hidden", type=int, default=1024)
+
+    # trainable adjacency (GSL) args (paper-style)
+    p.add_argument("--gsl_type", type=str, default="relu",
+                   choices=["relu", "directed", "unidirected", "undirected"])
+    p.add_argument("--alpha", type=float, default=0.1)
+    p.add_argument("--k", type=int, default=None,
+                   help="Top-k sparsification for adjacency (None => dense)")
 
     # training
     p.add_argument("--n_epochs", type=int, default=10)
@@ -73,15 +85,17 @@ def apply_feature_mode(dataset: FDDDataset, mode: str):
         start_col = 22
         end_col = min(41, dataset.df.shape[1])
         if dataset.df.shape[1] > start_col:
-            dataset.df = dataset.df.drop(
-                columns=dataset.df.columns[start_col:end_col]
-            )
+            dataset.df = dataset.df.drop(columns=dataset.df.columns[start_col:end_col])
         return
+
+    raise ValueError(f"Unknown feature_mode: {mode}")
 
 
 def subsample_train(dataset: FDDDataset, percent: float, seed: int):
     if percent >= 100:
         return
+    if percent <= 0:
+        raise ValueError("train_percent must be > 0")
 
     rng = np.random.default_rng(seed)
     mask = dataset.train_mask.astype(bool)
@@ -104,16 +118,15 @@ def normalize(dataset: FDDDataset):
 
 def adapt_input(ts: torch.Tensor, model_type: str) -> torch.Tensor:
     # ts: [B, T, F]
-    if model_type == "gnn_fixed":
-        return ts.transpose(1, 2)  # → [B, F, T]
+    if model_type in ["gnn_fixed", "gnn_trainable"]:
+        return ts.transpose(1, 2)  # -> [B, F, T] i.e. [B, N, T]
     return ts
 
 
 def load_adjacency(path: str):
     if path.endswith(".npy"):
         return np.load(path)
-    else:
-        return np.loadtxt(path)
+    return np.loadtxt(path)
 
 
 # -------------------------------------------------
@@ -137,7 +150,6 @@ def main():
 
     n_nodes = dataset.df.shape[1]
     n_classes = len(set(dataset.label))
-
     print(f"n_nodes = {n_nodes}, n_classes = {n_classes}")
 
     train_dl = FDDDataloader(
@@ -162,16 +174,12 @@ def main():
         )
 
     elif args.model_type == "gnn_fixed":
-
         if args.adj_path is None:
             raise ValueError("You must provide --adj_path for gnn_fixed model")
 
         A = load_adjacency(args.adj_path)
-
         if A.shape != (n_nodes, n_nodes):
-            raise ValueError(
-                f"Adjacency shape {A.shape} does not match n_nodes {n_nodes}"
-            )
+            raise ValueError(f"Adjacency shape {A.shape} does not match n_nodes {n_nodes}")
 
         model = GNN_TAM_FixedAdj(
             n_nodes=n_nodes,
@@ -180,6 +188,20 @@ def main():
             adj_fixed=A,
             n_gnn=args.n_gnn,
             n_hidden=args.n_hidden,
+            device=device,
+        )
+
+    elif args.model_type == "gnn_trainable":
+        # This is the paper architecture with trainable adjacency (GSL)
+        model = GNN_TAM_Trainable(
+            n_nodes=n_nodes,
+            window_size=args.window_size,
+            n_classes=n_classes,
+            n_gnn=args.n_gnn,
+            gsl_type=args.gsl_type,
+            n_hidden=args.n_hidden,
+            alpha=args.alpha,
+            k=args.k,
             device=device,
         )
 
@@ -201,14 +223,24 @@ def main():
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     run_name = args.run_name
     if run_name is None:
-        run_name = f"{args.model_type}_tp{args.train_percent:g}_ws{args.window_size}_{timestamp}"
+        # include model details to avoid confusion later
+        extra = ""
+        if args.model_type == "gnn_fixed":
+            extra = "_fixed"
+        if args.model_type == "gnn_trainable":
+            extra = f"_gsl{args.gsl_type}_k{args.k if args.k is not None else 'dense'}"
+
+        run_name = (
+            f"{args.model_type}{extra}"
+            f"_tp{args.train_percent:g}_ws{args.window_size}_seed{args.seed}_{timestamp}"
+        )
 
     run_dir = Path(args.save_dir) / run_name
     run_dir.mkdir(parents=True, exist_ok=True)
 
     (run_dir / "config.json").write_text(
         json.dumps(vars(args), indent=2, ensure_ascii=False),
-        encoding="utf-8"
+        encoding="utf-8",
     )
 
     # ------------------
@@ -221,10 +253,10 @@ def main():
         losses = []
 
         for ts_np, _, y_np in tqdm(train_dl, leave=False):
-            ts = torch.as_tensor(ts_np, dtype=torch.float32, device=device)
+            ts = torch.as_tensor(ts_np, dtype=torch.float32, device=device)  # [B, T, F]
             y = torch.as_tensor(y_np, dtype=torch.long, device=device)
 
-            ts = adapt_input(ts, args.model_type)
+            ts = adapt_input(ts, args.model_type)  # gnn -> [B, F, T]
 
             logits = model(ts)
             loss = F.cross_entropy(logits, y, weight=weight)
@@ -245,7 +277,7 @@ def main():
     torch.save(model, run_dir / "model.pt")
     (run_dir / "metrics.json").write_text(
         json.dumps(history, indent=2, ensure_ascii=False),
-        encoding="utf-8"
+        encoding="utf-8",
     )
 
     print(f"Model saved to: {run_dir / 'model.pt'}")
