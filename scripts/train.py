@@ -14,13 +14,14 @@ from fddbenchmark import FDDDataset, FDDDataloader
 
 # ---- models ----
 from src.models.baselines.mlp import MLPBaseline
+from src.models.gnn.gnn_fixed_adj import GNN_TAM_FixedAdj
 
 
 # -------------------------------------------------
 # Argument parser
 # -------------------------------------------------
 def parse_args():
-    p = argparse.ArgumentParser(description="Unified trainer (train/test only)")
+    p = argparse.ArgumentParser(description="Unified Trainer (MLP + GNN Fixed)")
 
     # data
     p.add_argument("--dataset", type=str, default="reinartz_tep")
@@ -34,7 +35,11 @@ def parse_args():
 
     # model
     p.add_argument("--model_type", type=str, default="mlp",
-                   choices=["mlp", "gru", "cnn1d", "gnn"])
+                   choices=["mlp", "gnn_fixed"])
+    p.add_argument("--adj_path", type=str, default=None,
+                   help="Path to adjacency matrix file (.txt or .npy) for gnn_fixed")
+    p.add_argument("--n_gnn", type=int, default=1)
+    p.add_argument("--n_hidden", type=int, default=1024)
 
     # training
     p.add_argument("--n_epochs", type=int, default=10)
@@ -59,10 +64,8 @@ def set_seed(seed: int):
 
 def apply_feature_mode(dataset: FDDDataset, mode: str):
     if mode == "te_33":
-        cols = [f"xmeas_{i}" for i in range(1, 23)] + [f"xmv_{i}" for i in range(1, 12)]
-        missing = [c for c in cols if c not in dataset.df.columns]
-        if missing:
-            raise ValueError(f"Missing TE columns: {missing}")
+        cols = [f"xmeas_{i}" for i in range(1, 23)] + \
+               [f"xmv_{i}" for i in range(1, 12)]
         dataset.df = dataset.df[cols]
         return
 
@@ -70,17 +73,15 @@ def apply_feature_mode(dataset: FDDDataset, mode: str):
         start_col = 22
         end_col = min(41, dataset.df.shape[1])
         if dataset.df.shape[1] > start_col:
-            dataset.df = dataset.df.drop(columns=dataset.df.columns[start_col:end_col])
+            dataset.df = dataset.df.drop(
+                columns=dataset.df.columns[start_col:end_col]
+            )
         return
-
-    raise ValueError(f"Unknown feature_mode: {mode}")
 
 
 def subsample_train(dataset: FDDDataset, percent: float, seed: int):
     if percent >= 100:
         return
-    if percent <= 0:
-        raise ValueError("train_percent must be > 0")
 
     rng = np.random.default_rng(seed)
     mask = dataset.train_mask.astype(bool)
@@ -103,9 +104,16 @@ def normalize(dataset: FDDDataset):
 
 def adapt_input(ts: torch.Tensor, model_type: str) -> torch.Tensor:
     # ts: [B, T, F]
-    if model_type in ["cnn1d", "gnn"]:
-        return ts.transpose(1, 2)  # [B, F, T]
+    if model_type == "gnn_fixed":
+        return ts.transpose(1, 2)  # → [B, F, T]
     return ts
+
+
+def load_adjacency(path: str):
+    if path.endswith(".npy"):
+        return np.load(path)
+    else:
+        return np.loadtxt(path)
 
 
 # -------------------------------------------------
@@ -152,8 +160,31 @@ def main():
             n_nodes=n_nodes,
             n_classes=n_classes,
         )
+
+    elif args.model_type == "gnn_fixed":
+
+        if args.adj_path is None:
+            raise ValueError("You must provide --adj_path for gnn_fixed model")
+
+        A = load_adjacency(args.adj_path)
+
+        if A.shape != (n_nodes, n_nodes):
+            raise ValueError(
+                f"Adjacency shape {A.shape} does not match n_nodes {n_nodes}"
+            )
+
+        model = GNN_TAM_FixedAdj(
+            n_nodes=n_nodes,
+            window_size=args.window_size,
+            n_classes=n_classes,
+            adj_fixed=A,
+            n_gnn=args.n_gnn,
+            n_hidden=args.n_hidden,
+            device=device,
+        )
+
     else:
-        raise NotImplementedError("Only MLP is wired for now.")
+        raise NotImplementedError("Unknown model type")
 
     model.to(device)
     print(model)
@@ -170,7 +201,7 @@ def main():
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     run_name = args.run_name
     if run_name is None:
-        run_name = f"{args.model_type}_tp{args.train_percent:g}_ws{args.window_size}_seed{args.seed}_{timestamp}"
+        run_name = f"{args.model_type}_tp{args.train_percent:g}_ws{args.window_size}_{timestamp}"
 
     run_dir = Path(args.save_dir) / run_name
     run_dir.mkdir(parents=True, exist_ok=True)
