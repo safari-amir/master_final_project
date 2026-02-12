@@ -16,13 +16,16 @@ from fddbenchmark import FDDDataset, FDDDataloader
 from src.models.baselines.mlp import MLPBaseline
 from src.models.gnn.gnn_fixed_adj import GNN_TAM_FixedAdj
 from src.models.gnn.gnn_trainable_adj import GNN_TAM_Trainable
+from src.models.gnn.gnn_trainable_with_prior import GNN_TAM_TrainableWithPrior
 
 
 # -------------------------------------------------
 # Argument parser
 # -------------------------------------------------
 def parse_args():
-    p = argparse.ArgumentParser(description="Unified Trainer (MLP + GNN Fixed + GNN Trainable)")
+    p = argparse.ArgumentParser(
+        description="Unified Trainer (MLP + GNN Fixed + Trainable + Trainable+Prior)"
+    )
 
     # data
     p.add_argument("--dataset", type=str, default="reinartz_tep")
@@ -36,22 +39,23 @@ def parse_args():
 
     # model
     p.add_argument("--model_type", type=str, default="mlp",
-                   choices=["mlp", "gnn_fixed", "gnn_trainable"])
+                   choices=["mlp", "gnn_fixed", "gnn_trainable", "gnn_trainable_prior"])
 
-    # fixed adjacency args
-    p.add_argument("--adj_path", type=str, default=None,
-                   help="Path to adjacency matrix file (.txt or .npy) for gnn_fixed")
+    # fixed adjacency
+    p.add_argument("--adj_path", type=str, default=None)
 
-    # shared GNN args
+    # shared GNN
     p.add_argument("--n_gnn", type=int, default=1)
     p.add_argument("--n_hidden", type=int, default=1024)
 
-    # trainable adjacency (GSL) args (paper-style)
-    p.add_argument("--gsl_type", type=str, default="relu",
-                   choices=["relu", "directed", "unidirected", "undirected"])
+    # trainable adjacency
+    p.add_argument("--gsl_type", type=str, default="relu")
     p.add_argument("--alpha", type=float, default=0.1)
-    p.add_argument("--k", type=int, default=None,
-                   help="Top-k sparsification for adjacency (None => dense)")
+    p.add_argument("--k", type=int, default=None)
+
+    # prior
+    p.add_argument("--prior_path", type=str, default=None)
+    p.add_argument("--train_residual", action="store_true")
 
     # training
     p.add_argument("--n_epochs", type=int, default=10)
@@ -59,7 +63,6 @@ def parse_args():
 
     # saving
     p.add_argument("--save_dir", type=str, default="outputs/runs")
-    p.add_argument("--run_name", type=str, default=None)
 
     return p.parse_args()
 
@@ -67,35 +70,31 @@ def parse_args():
 # -------------------------------------------------
 # Utilities
 # -------------------------------------------------
-def set_seed(seed: int):
+def set_seed(seed):
     np.random.seed(seed)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
 
-def apply_feature_mode(dataset: FDDDataset, mode: str):
+def apply_feature_mode(dataset, mode):
     if mode == "te_33":
         cols = [f"xmeas_{i}" for i in range(1, 23)] + \
                [f"xmv_{i}" for i in range(1, 12)]
         dataset.df = dataset.df[cols]
-        return
 
-    if mode == "drop_29_41":
+    elif mode == "drop_29_41":
         start_col = 22
         end_col = min(41, dataset.df.shape[1])
         if dataset.df.shape[1] > start_col:
-            dataset.df = dataset.df.drop(columns=dataset.df.columns[start_col:end_col])
-        return
+            dataset.df = dataset.df.drop(
+                columns=dataset.df.columns[start_col:end_col]
+            )
 
-    raise ValueError(f"Unknown feature_mode: {mode}")
 
-
-def subsample_train(dataset: FDDDataset, percent: float, seed: int):
+def subsample_train(dataset, percent, seed):
     if percent >= 100:
         return
-    if percent <= 0:
-        raise ValueError("train_percent must be > 0")
 
     rng = np.random.default_rng(seed)
     mask = dataset.train_mask.astype(bool)
@@ -110,20 +109,19 @@ def subsample_train(dataset: FDDDataset, percent: float, seed: int):
     dataset.train_mask = new_mask
 
 
-def normalize(dataset: FDDDataset):
+def normalize(dataset):
     scaler = StandardScaler()
     scaler.fit(dataset.df[dataset.train_mask])
     dataset.df[:] = scaler.transform(dataset.df)
 
 
-def adapt_input(ts: torch.Tensor, model_type: str) -> torch.Tensor:
-    # ts: [B, T, F]
-    if model_type in ["gnn_fixed", "gnn_trainable"]:
-        return ts.transpose(1, 2)  # -> [B, F, T] i.e. [B, N, T]
+def adapt_input(ts, model_type):
+    if model_type in ["gnn_fixed", "gnn_trainable", "gnn_trainable_prior"]:
+        return ts.transpose(1, 2)
     return ts
 
 
-def load_adjacency(path: str):
+def load_adjacency(path):
     if path.endswith(".npy"):
         return np.load(path)
     return np.loadtxt(path)
@@ -139,9 +137,6 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("Using device:", device)
 
-    # ------------------
-    # 1) Load dataset
-    # ------------------
     dataset = FDDDataset(name=args.dataset)
 
     apply_feature_mode(dataset, args.feature_mode)
@@ -150,7 +145,6 @@ def main():
 
     n_nodes = dataset.df.shape[1]
     n_classes = len(set(dataset.label))
-    print(f"n_nodes = {n_nodes}, n_classes = {n_classes}")
 
     train_dl = FDDDataloader(
         dataframe=dataset.df,
@@ -163,28 +157,15 @@ def main():
         shuffle=True,
     )
 
-    # ------------------
-    # 2) Build model
-    # ------------------
+    # ------------------ Build model ------------------
+
     if args.model_type == "mlp":
-        model = MLPBaseline(
-            window_size=args.window_size,
-            n_nodes=n_nodes,
-            n_classes=n_classes,
-        )
+        model = MLPBaseline(args.window_size, n_nodes, n_classes)
 
     elif args.model_type == "gnn_fixed":
-        if args.adj_path is None:
-            raise ValueError("You must provide --adj_path for gnn_fixed model")
-
         A = load_adjacency(args.adj_path)
-        if A.shape != (n_nodes, n_nodes):
-            raise ValueError(f"Adjacency shape {A.shape} does not match n_nodes {n_nodes}")
-
         model = GNN_TAM_FixedAdj(
-            n_nodes=n_nodes,
-            window_size=args.window_size,
-            n_classes=n_classes,
+            n_nodes, args.window_size, n_classes,
             adj_fixed=A,
             n_gnn=args.n_gnn,
             n_hidden=args.n_hidden,
@@ -192,11 +173,8 @@ def main():
         )
 
     elif args.model_type == "gnn_trainable":
-        # This is the paper architecture with trainable adjacency (GSL)
         model = GNN_TAM_Trainable(
-            n_nodes=n_nodes,
-            window_size=args.window_size,
-            n_classes=n_classes,
+            n_nodes, args.window_size, n_classes,
             n_gnn=args.n_gnn,
             gsl_type=args.gsl_type,
             n_hidden=args.n_hidden,
@@ -205,58 +183,43 @@ def main():
             device=device,
         )
 
+    elif args.model_type == "gnn_trainable_prior":
+        A_np = load_adjacency(args.prior_path)
+        A_prior = torch.tensor(A_np, dtype=torch.float32, device=device)
+
+        model = GNN_TAM_TrainableWithPrior(
+            n_nodes, args.window_size, n_classes,
+            n_gnn=args.n_gnn,
+            n_hidden=args.n_hidden,
+            k=args.k,
+            device=device,
+            A_prior=A_prior,
+            train_residual=args.train_residual,
+        )
+
     else:
-        raise NotImplementedError("Unknown model type")
+        raise NotImplementedError
 
     model.to(device)
-    print(model)
-
     optimizer = Adam(model.parameters(), lr=args.lr)
 
     weight = torch.ones(n_classes, device=device) * 0.5
     if n_classes > 1:
         weight[1:] /= (n_classes - 1)
 
-    # ------------------
-    # 3) Run directory
-    # ------------------
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_name = args.run_name
-    if run_name is None:
-        # include model details to avoid confusion later
-        extra = ""
-        if args.model_type == "gnn_fixed":
-            extra = "_fixed"
-        if args.model_type == "gnn_trainable":
-            extra = f"_gsl{args.gsl_type}_k{args.k if args.k is not None else 'dense'}"
+    # ------------------ Training ------------------
 
-        run_name = (
-            f"{args.model_type}{extra}"
-            f"_tp{args.train_percent:g}_ws{args.window_size}_seed{args.seed}_{timestamp}"
-        )
-
-    run_dir = Path(args.save_dir) / run_name
-    run_dir.mkdir(parents=True, exist_ok=True)
-
-    (run_dir / "config.json").write_text(
-        json.dumps(vars(args), indent=2, ensure_ascii=False),
-        encoding="utf-8",
-    )
-
-    # ------------------
-    # 4) Training loop
-    # ------------------
     history = {"train_loss": []}
 
-    for e in trange(args.n_epochs, desc="Epochs"):
+    for e in trange(args.n_epochs):
         model.train()
         losses = []
 
-        for ts_np, _, y_np in tqdm(train_dl, leave=False):
-            ts = torch.as_tensor(ts_np, dtype=torch.float32, device=device)  # [B, T, F]
+        for ts_np, _, y_np in train_dl:
+            ts = torch.as_tensor(ts_np, dtype=torch.float32, device=device)
             y = torch.as_tensor(y_np, dtype=torch.long, device=device)
 
-            ts = adapt_input(ts, args.model_type)  # gnn -> [B, F, T]
+            ts = adapt_input(ts, args.model_type)
 
             logits = model(ts)
             loss = F.cross_entropy(logits, y, weight=weight)
@@ -269,18 +232,44 @@ def main():
 
         avg_loss = float(np.mean(losses))
         history["train_loss"].append(avg_loss)
-        print(f"Epoch {e+1:02d}/{args.n_epochs} | train_loss = {avg_loss:.4f}")
+        print(f"Epoch {e+1}: {avg_loss:.4f}")
 
-    # ------------------
-    # 5) Save model
-    # ------------------
+    # ------------------ Save ------------------
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    extra = ""
+    if args.model_type == "gnn_fixed":
+        extra = "_fixed"
+    elif args.model_type == "gnn_trainable":
+        extra = f"_gsl{args.gsl_type}"
+    elif args.model_type == "gnn_trainable_prior":
+        extra = "_prior_residual" if args.train_residual else "_prior_init"
+
+    run_name = (
+        f"{args.model_type}{extra}"
+        f"_tp{args.train_percent:g}"
+        f"_ws{args.window_size}"
+        f"_seed{args.seed}"
+        f"_{timestamp}"
+    )
+
+    run_dir = Path(args.save_dir) / run_name
+    run_dir.mkdir(parents=True, exist_ok=True)
+
     torch.save(model, run_dir / "model.pt")
+
+    (run_dir / "config.json").write_text(
+        json.dumps(vars(args), indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
     (run_dir / "metrics.json").write_text(
         json.dumps(history, indent=2, ensure_ascii=False),
         encoding="utf-8",
     )
 
-    print(f"Model saved to: {run_dir / 'model.pt'}")
+    print("Saved to:", run_dir)
 
 
 if __name__ == "__main__":

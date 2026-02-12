@@ -58,8 +58,8 @@ class GNN_TAM_TrainableWithPrior(nn.Module):
                     k=k,
                     device=device,
                     A_prior=A_prior,
-                    lambda_prior=lambda_prior,
-                    train_residual=train_residual,
+                    #lambda_prior=lambda_prior,
+                    #train_residual=train_residual,
                 )
             )
 

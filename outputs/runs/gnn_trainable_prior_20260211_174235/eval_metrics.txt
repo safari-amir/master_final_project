@@ -1,0 +1,41 @@
+FDD metrics
+-----------------
+TPR/FPR:
+    Fault 01: 0.9923/0.0000
+    Fault 02: 0.9897/0.0000
+    Fault 03: 0.8779/0.0006
+    Fault 04: 0.9983/0.0000
+    Fault 05: 0.9717/0.0000
+    Fault 06: 0.9926/0.0000
+    Fault 07: 0.9980/0.0000
+    Fault 08: 0.9606/0.0000
+    Fault 09: 0.1963/0.0030
+    Fault 10: 0.9391/0.0000
+    Fault 11: 0.9857/0.0000
+    Fault 12: 0.9793/0.0000
+    Fault 13: 0.9674/0.0000
+    Fault 14: 0.9955/0.0000
+    Fault 15: 0.0129/0.0001
+    Fault 16: 0.5852/0.0031
+    Fault 17: 0.9731/0.0000
+    Fault 18: 0.9474/0.0000
+    Fault 19: 0.9888/0.0000
+    Fault 20: 0.9695/0.0000
+    Fault 21: 0.0000/0.0000
+    Fault 22: 0.7342/0.0011
+    Fault 23: 0.0000/0.0000
+    Fault 24: 0.9839/0.0000
+    Fault 25: 0.9830/0.0000
+    Fault 26: 0.9743/0.0000
+    Fault 27: 0.9843/0.0000
+    Fault 28: 0.9545/0.0000
+Detection TPR: 0.8475
+Detection FPR: 0.0078
+Average Detection Delay (ADD): 62.57
+Total Correct Diagnosis Rate (Total CDR): 0.9665
+
+Clustering metrics
+-----------------
+Adjusted Rand Index (ARI): 0.6634
+Normalized Mutual Information (NMI): 0.8774
+Unsupervised Clustering Accuracy (ACC): 0.8646
