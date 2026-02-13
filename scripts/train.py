@@ -8,7 +8,7 @@ import torch
 import torch.nn.functional as F
 from torch.optim import Adam
 from sklearn.preprocessing import StandardScaler
-from tqdm.auto import tqdm, trange
+from tqdm.auto import trange
 
 from fddbenchmark import FDDDataset, FDDDataloader
 
@@ -17,6 +17,7 @@ from src.models.baselines.mlp import MLPBaseline
 from src.models.gnn.gnn_fixed_adj import GNN_TAM_FixedAdj
 from src.models.gnn.gnn_trainable_adj import GNN_TAM_Trainable
 from src.models.gnn.gnn_trainable_with_prior import GNN_TAM_TrainableWithPrior
+from src.models.gnn.gnn_trainable_partial_freeze import GNN_TAM_PartialFreeze
 
 
 # -------------------------------------------------
@@ -24,7 +25,7 @@ from src.models.gnn.gnn_trainable_with_prior import GNN_TAM_TrainableWithPrior
 # -------------------------------------------------
 def parse_args():
     p = argparse.ArgumentParser(
-        description="Unified Trainer (MLP + GNN Fixed + Trainable + Trainable+Prior)"
+        description="Unified Trainer (MLP + GNN variants)"
     )
 
     # data
@@ -39,22 +40,23 @@ def parse_args():
 
     # model
     p.add_argument("--model_type", type=str, default="mlp",
-                   choices=["mlp", "gnn_fixed", "gnn_trainable", "gnn_trainable_prior"])
+                   choices=["mlp", "gnn_fixed",
+                            "gnn_trainable",
+                            "gnn_trainable_prior",
+                            "gnn_partial"])
 
-    # fixed adjacency
+    # adjacency
     p.add_argument("--adj_path", type=str, default=None)
+    p.add_argument("--prior_path", type=str, default=None)
 
-    # shared GNN
+    # GNN shared
     p.add_argument("--n_gnn", type=int, default=1)
     p.add_argument("--n_hidden", type=int, default=1024)
-
-    # trainable adjacency
     p.add_argument("--gsl_type", type=str, default="relu")
     p.add_argument("--alpha", type=float, default=0.1)
     p.add_argument("--k", type=int, default=None)
 
-    # prior
-    p.add_argument("--prior_path", type=str, default=None)
+    # prior options
     p.add_argument("--train_residual", action="store_true")
 
     # training
@@ -116,7 +118,10 @@ def normalize(dataset):
 
 
 def adapt_input(ts, model_type):
-    if model_type in ["gnn_fixed", "gnn_trainable", "gnn_trainable_prior"]:
+    if model_type in ["gnn_fixed",
+                      "gnn_trainable",
+                      "gnn_trainable_prior",
+                      "gnn_partial"]:
         return ts.transpose(1, 2)
     return ts
 
@@ -197,6 +202,23 @@ def main():
             train_residual=args.train_residual,
         )
 
+    elif args.model_type == "gnn_partial":
+        A_np = load_adjacency(args.prior_path)
+        A_prior = torch.tensor(A_np, dtype=torch.float32, device=device)
+
+        # 🔒 freeze strong edges (customizable)
+        freeze_mask = (A_prior > 0.5).float()
+
+        model = GNN_TAM_PartialFreeze(
+            n_nodes, args.window_size, n_classes,
+            n_gnn=args.n_gnn,
+            n_hidden=args.n_hidden,
+            k=args.k,
+            device=device,
+            A_prior=A_prior,
+            freeze_mask=freeze_mask,
+        )
+
     else:
         raise NotImplementedError
 
@@ -238,19 +260,12 @@ def main():
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-    extra = ""
-    if args.model_type == "gnn_fixed":
-        extra = "_fixed"
-    elif args.model_type == "gnn_trainable":
-        extra = f"_gsl{args.gsl_type}"
-    elif args.model_type == "gnn_trainable_prior":
-        extra = "_prior_residual" if args.train_residual else "_prior_init"
-
     run_name = (
-        f"{args.model_type}{extra}"
+        f"{args.model_type}"
         f"_tp{args.train_percent:g}"
         f"_ws{args.window_size}"
         f"_seed{args.seed}"
+        f"_ep{args.n_epochs}"
         f"_{timestamp}"
     )
 
